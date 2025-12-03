@@ -1,0 +1,82 @@
+// Arduino Nano: чтение "cx,cy,w,h\n" или "null,null,null,null\n"
+#include <Arduino.h>
+
+static const uint32_t BAUD = 115200;
+static const size_t   BUF_LEN = 64;
+
+char lineBuf[BUF_LEN];
+size_t linePos = 0;
+
+void processLine(char* s) {
+  // Удалим \r, если есть
+  size_t n = strlen(s);
+  while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n')) { s[--n] = '\0'; }
+
+  // Разбиваем по запятым
+  char* tokens[4] = {0,0,0,0};
+  int count = 0;
+  char* p = s;
+  tokens[count++] = p;
+  for (; *p && count < 4; ++p) {
+    if (*p == ',') {
+      *p = '\0';
+      tokens[count++] = p + 1;
+    }
+  }
+  if (count < 4) {
+    // Плохая строка
+    return;
+  }
+
+  auto isNull = [](const char* t)->bool {
+    if (!t) return true;
+    // допускаем 'null' или 'NULL'
+    return (strcasecmp(t, "null") == 0);
+  };
+
+  bool anyNull = isNull(tokens[0]) || isNull(tokens[1]) || isNull(tokens[2]) || isNull(tokens[3]);
+
+  if (anyNull) {
+    // Цель не обнаружена
+    // TODO: ваша логика при отсутствии цели (например, остановить моторы)
+    // Пример отладочного вывода:
+    // Serial.println(F("No target"));
+    return;
+  }
+
+  // Парсим целые значения
+  long cx = strtol(tokens[0], nullptr, 10);
+  long cy = strtol(tokens[1], nullptr, 10);
+  long w  = strtol(tokens[2], nullptr, 10);
+  long h  = strtol(tokens[3], nullptr, 10);
+
+  // TODO: используйте cx, cy, w, h в ПИД/управлении моторами
+  // Пример отладочного вывода:
+  // Serial.print(F("cx=")); Serial.print(cx);
+  // Serial.print(F(" cy=")); Serial.print(cy);
+  // Serial.print(F(" w="));  Serial.print(w);
+  // Serial.print(F(" h="));  Serial.println(h);
+}
+
+void setup() {
+  Serial.begin(BAUD);
+  // Serial.println(F("Ready"));
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      lineBuf[linePos] = '\0';
+      processLine(lineBuf);
+      linePos = 0;
+    } else {
+      if (linePos < (BUF_LEN - 1)) {
+        lineBuf[linePos++] = c;
+      } else {
+        // Переполнение — сброс
+        linePos = 0;
+      }
+    }
+  }
+}
