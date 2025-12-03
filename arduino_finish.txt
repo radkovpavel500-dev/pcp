@@ -1,0 +1,247 @@
+#include <Arduino.h>
+
+// ----------------- Серийный интерфейс и буфер -----------------
+static const uint32_t BAUD = 115200;
+static const size_t   BUF_LEN = 64;
+static const uint16_t BLINK_INTERVAL_MS = 200;
+
+char lineBuf[BUF_LEN];
+size_t linePos = 0;
+
+bool ledState = false;
+unsigned long lastToggleMs = 0;
+
+// ----------------- Логика цели с Raspberry Pi -----------------
+
+// Последняя полученная цель
+long targetCx = 0;
+long targetCy = 0;
+bool haveTarget = false;  // есть ли валидная цель сейчас
+
+// Параметры изображения
+const int IMG_W = 1280;
+const int IMG_H = 720;
+const int CENTER_X = IMG_W / 2;  // 640
+const int CENTER_Y = IMG_H / 2;  // 360
+
+// "Мёртвая зона" вокруг центра: если цель внутри, моторы не двигаем
+const int DEADZONE_X = 40;
+const int DEADZONE_Y = 40;
+
+// ----------------- Шаговые моторы (CNC Shield, оси Y и A) -----------------
+
+// Пины Arduino Nano для CNC Shield v3
+// Ось ординат (слот Y)
+const byte pin_ordinate_step = 3;   // Y.STEP (D3)
+const byte pin_ordinate_dir  = 6;   // Y.DIR  (D6)
+
+// Ось абсцисс (слот A)
+const byte pin_abscissa_step = 12;  // A.STEP (D12)
+const byte pin_abscissa_dir  = 13;  // A.DIR  (D13)
+
+// Общий Enable всех драйверов на Shield
+const byte pin_enable = 8;          // EN (D8)
+
+// Параметры моторов (полный шаг, 1.8°/шаг)
+const int STEPS_PER_REV = 200;
+
+// Скорость шагания
+const int STEP_PULSE_US = 800;
+const int STEP_DELAY_US = 800;
+
+// Коэффициенты перевода: пиксели -> градусы
+// При dx = 100 пикселей получим поворот ~10° (0.1 * 100)
+const float DEG_PER_PIXEL_X = 0.10f;
+const float DEG_PER_PIXEL_Y = 0.10f;
+
+// Направления (подберёшь опытно: если крутит "не туда" — поменяй HIGH/LOW)
+const bool DIR_ABSCISSA_POS = HIGH;
+const bool DIR_ABSCISSA_NEG = LOW;
+
+const bool DIR_ORDINATE_POS = HIGH;
+const bool DIR_ORDINATE_NEG = LOW;
+
+// Период управления моторами
+const unsigned long CONTROL_INTERVAL_MS = 1000;
+unsigned long lastControlMs = 0;
+
+// ----------------- Вспомогательные функции -----------------
+
+bool isNullToken(const char* t) {
+  if (!t) return true;
+  if (strlen(t) != 4) return false;
+  return ( (t[0]=='n'||t[0]=='N') &&
+           (t[1]=='u'||t[1]=='U') &&
+           (t[2]=='l'||t[2]=='L') &&
+           (t[3]=='l'||t[3]=='L') );
+}
+
+void setLedOff() {
+  ledState = false;
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+// Шаги по оси ординат (Y)
+void moveOrdinatSteps(int steps, bool dir) {
+  if (steps <= 0) return;
+
+  digitalWrite(pin_ordinate_dir, dir);
+  for (int i = 0; i < steps; i++) {
+    digitalWrite(pin_ordinate_step, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(pin_ordinate_step, LOW);
+    delayMicroseconds(STEP_DELAY_US);
+  }
+}
+
+// Шаги по оси абсцисс (A)
+void moveAbscissaSteps(int steps, bool dir) {
+  if (steps <= 0) return;
+
+  digitalWrite(pin_abscissa_dir, dir);
+  for (int i = 0; i < steps; i++) {
+    digitalWrite(pin_abscissa_step, HIGH);
+    delayMicroseconds(STEP_PULSE_US);
+    digitalWrite(pin_abscissa_step, LOW);
+    delayMicroseconds(STEP_DELAY_US);
+  }
+}
+
+// Управление моторами по последней цели
+void updateMotorsToTarget() {
+  if (!haveTarget) return;  // цели нет — не двигаем
+
+  long dx = CENTER_X - targetCx;  // >0: цель левее центра
+  long dy = CENTER_Y - targetCy;  // >0: цель выше центра
+
+  // Если цель в мёртвой зоне и по X, и по Y — ничего не делаем
+  if (abs(dx) <= DEADZONE_X && abs(dy) <= DEADZONE_Y) {
+    return;
+  }
+
+  // Ось абсцисс (A, по X)
+  if (abs(dx) > DEADZONE_X) {
+    float angleX_deg = dx * DEG_PER_PIXEL_X;  // знак учитываем: в какую сторону крутить
+    float stepsX_f = angleX_deg * (float)STEPS_PER_REV / 360.0f;
+    float stepsX_mag = (stepsX_f >= 0.0f) ? stepsX_f : -stepsX_f;
+    int stepsX = (int)(stepsX_mag + 0.5f);    // округление до целого
+
+    if (stepsX > 0) {
+      bool dirX = (stepsX_f > 0.0f) ? DIR_ABSCISSA_POS : DIR_ABSCISSA_NEG;
+      moveAbscissaSteps(stepsX, dirX);
+    }
+  }
+
+  // Ось ординат (Y, по Y)
+  if (abs(dy) > DEADZONE_Y) {
+    float angleY_deg = dy * DEG_PER_PIXEL_Y;
+    float stepsY_f = angleY_deg * (float)STEPS_PER_REV / 360.0f;
+    float stepsY_mag = (stepsY_f >= 0.0f) ? stepsY_f : -stepsY_f;
+    int stepsY = (int)(stepsY_mag + 0.5f);
+
+    if (stepsY > 0) {
+      bool dirY = (stepsY_f > 0.0f) ? DIR_ORDINATE_POS : DIR_ORDINATE_NEG;
+      moveOrdinatSteps(stepsY, dirY);
+    }
+  }
+}
+
+// Обработка одной строки вида "cx,cy,w,h\n"
+void processLine(char* s) {
+  size_t n = strlen(s);
+  while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n')) {
+    s[--n] = '\0';
+  }
+
+  char* tokens[4] = {0,0,0,0};
+  int count = 0;
+  char* p = s;
+  tokens[count++] = p;
+  for (; *p && count < 4; ++p) {
+    if (*p == ',') {
+      *p = '\0';
+      tokens[count++] = p + 1;
+    }
+  }
+  if (count < 4) return;
+
+  // Если "null" в любом поле — невалидно
+  if (isNullToken(tokens[0]) || isNullToken(tokens[1]) ||
+      isNullToken(tokens[2]) || isNullToken(tokens[3])) {
+    haveTarget = false;
+    setLedOff();
+    return;
+  }
+
+  long cx = strtol(tokens[0], nullptr, 10);
+  long cy = strtol(tokens[1], nullptr, 10);
+  long w  = strtol(tokens[2], nullptr, 10);
+  long h  = strtol(tokens[3], nullptr, 10);
+
+  // Невалидный маркер: все четыре поля == -1
+  bool invalid = (cx == -1 && cy == -1 && w == -1 && h == -1);
+
+  if (invalid) {
+    haveTarget = false;
+    setLedOff();
+    return;
+  }
+
+  // Валидные данные: запоминаем цель
+  targetCx = cx;
+  targetCy = cy;
+  haveTarget = true;
+
+  // Мигание светодиода при валидных данных (как раньше)
+  unsigned long now = millis();
+  if (now - lastToggleMs >= BLINK_INTERVAL_MS) {
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+    lastToggleMs = now;
+  }
+
+  // cx, cy, w, h теперь используются для управления моторами в updateMotorsToTarget()
+}
+
+// ----------------- setup / loop -----------------
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial.begin(BAUD);
+
+  // Пины моторов
+  pinMode(pin_ordinate_step, OUTPUT);
+  pinMode(pin_ordinate_dir,  OUTPUT);
+  pinMode(pin_abscissa_step, OUTPUT);
+  pinMode(pin_abscissa_dir,  OUTPUT);
+  pinMode(pin_enable, OUTPUT);
+
+  // Включаем драйверы на CNC Shield (ENABLE = LOW)
+  digitalWrite(pin_enable, LOW);
+}
+
+void loop() {
+  // Приём строк из Serial
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      lineBuf[linePos] = '\0';
+      processLine(lineBuf);
+      linePos = 0;
+    } else {
+      if (linePos < (BUF_LEN - 1)) {
+        lineBuf[linePos++] = c;
+      } else {
+        linePos = 0; // переполнение — сброс
+      }
+    }
+  }
+
+  // Раз в секунду — подстройка моторов под текущую цель
+  unsigned long now = millis();
+  if (now - lastControlMs >= CONTROL_INTERVAL_MS) {
+    lastControlMs = now;
+    updateMotorsToTarget();
+  }
+}
